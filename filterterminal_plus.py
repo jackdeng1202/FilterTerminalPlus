@@ -89,7 +89,8 @@ DEFAULT_QUICK_CMDS = [
 
 
 # ============================================================
-# 过滤表达式：词法 + 递归下降解析（兼容原版 \| 终止写法）
+# 过滤表达式：仅按 | 拆分为多个字面条件，条件原样匹配
+# （空格、引号等都是条件内容的一部分；想要 OR 就写 |，无其他语法）
 # ============================================================
 class Node:
     __slots__ = ("kind", "kids", "word")
@@ -97,121 +98,14 @@ class Node:
         self.kind, self.kids, self.word = kind, kids or [], word
 
 
-def tokenize(expr):
-    """返回 token 列表: ('(', ')', '!', '&&', '|', 'WORD', text)
-    两种模式自动切换：
-    - 表达式含 '\\' → 原版模式：空格属于词内容，'\\' 才终止词（支持尾部空格）
-    - 否则 → 新模式：空白分隔词
-    引号 " 是词的字面字符（匹配日志里真实存在的引号），不是分组符。"""
-    tokens, i, n = [], 0, len(expr)
-    buf = []
-    orig_mode = "\\" in expr
-
-    def flush():
-        if buf:
-            tokens.append(("WORD", "".join(buf)))
-            buf.clear()
-
-    while i < n:
-        c = expr[i]
-        if c in " \t\r\n":
-            if orig_mode:
-                if buf:
-                    buf.append(c)  # 原版模式：空格是词的一部分
-                i += 1
-            else:
-                flush(); i += 1
-        elif c == "\\":
-            # 原版语义: 反斜杠 = 词终止符（允许词内含空格/尾部空格）
-            flush(); i += 1
-        elif c == "(":
-            flush(); tokens.append(("(", None)); i += 1
-        elif c == ")":
-            flush(); tokens.append((")", None)); i += 1
-        elif c == "!":
-            flush(); tokens.append(("!", None)); i += 1
-        elif c == "&":
-            flush()
-            if i + 1 < n and expr[i + 1] == "&":
-                tokens.append(("&&", None)); i += 2
-            else:
-                raise ValueError("单独的 & 无效，AND 请写 &&")
-        elif c == "|":
-            flush()
-            j = i + 1
-            while j < n and expr[j] == "|":
-                j += 1  # 兼容 || 与 \|| 等
-            tokens.append(("|", None)); i = j
-        else:
-            buf.append(c); i += 1
-    flush()
-    return tokens
-
-
-class Parser:
-    """递归下降: expr := or; or := and ('|' and)*; and := seq (空格相邻原子或
-    '&&' 分隔，均按 AND 组合); not := '!' not | atom; atom := '(' expr ')' | WORD。
-    空格分隔多个词 = 所有词都要命中（AND）。"""
-
-    def __init__(self, tokens):
-        self.toks = tokens
-        self.pos = 0
-
-    def peek(self):
-        return self.toks[self.pos] if self.pos < len(self.toks) else (None, None)
-
-    def next(self):
-        t = self.peek()
-        self.pos += 1
-        return t
-
-    def parse(self):
-        if not self.toks:
-            raise ValueError("空表达式")
-        node = self.expr()
-        if self.pos != len(self.toks):
-            raise ValueError("多余的内容: %r" % (self.toks[self.pos],))
-        return node
-
-    def expr(self):
-        node = self.and_()
-        ors = [node]
-        while self.peek() == ("|", None):
-            self.next()
-            ors.append(self.and_())
-        return Node("or", ors) if len(ors) > 1 else node
-
-    def and_(self):
-        # 空格分隔的相邻原子与 && 都表示 AND：into home == into && home（都要命中）
-        parts = [self.not_()]
-        while True:
-            k, _ = self.peek()
-            if k == "&&":
-                self.next()
-                parts.append(self.not_())
-            elif k in ("WORD", "(", "!"):
-                parts.append(self.not_())
-            else:
-                break
-        return parts[0] if len(parts) == 1 else Node("and", parts)
-
-    def not_(self):
-        if self.peek() == ("!", None):
-            self.next()
-            return Node("not", [self.not_()])
-        return self.atom()
-
-    def atom(self):
-        kind, val = self.next()
-        if kind == "(":
-            node = self.expr()
-            k, _ = self.next()
-            if k != ")":
-                raise ValueError("缺少右括号 )")
-            return node
-        if kind == "WORD":
-            return Node("word", word=val)
-        raise ValueError("此处应为一个词" + ("" if kind is None else "，得到 %r" % kind))
+def split_or_expr(expr):
+    """按 | 拆分表达式为多个字面条件：
+    - 条件原样保留内部空格与引号等所有字符（"into home" 就是含空格的整体，
+      '"66"' 匹配内容里真实存在的引号）
+    - 仅去掉每个条件首尾的空白（写 'a | b' 与 'a|b' 等价）
+    - 连续多个 |（如 a||b）视为一个 |"""
+    parts = re.sub(r"\|{2,}", "|", expr).split("|")
+    return [p.strip() for p in parts if p.strip()]
 
 
 def _is_word_char(ch):
@@ -248,34 +142,17 @@ def _word_in_line(word, line, case_sensitive, whole_word):
 
 def compile_filter(expr, case_sensitive=False, whole_word=False):
     """编译表达式为谓词函数(line)->bool；同时返回 (words, tree) 供着色用。
-    words 是表达式中所有叶子词（按出现顺序）。"""
-    tree = Parser(tokenize(expr)).parse()
-    words = []
+    语法：条件1 | 条件2 | 条件3 —— 命中任一条件即通过；每个条件是字面子串，
+    空格/引号都按内容原样匹配（没有 AND、括号、引号分组等语法）。"""
+    words = split_or_expr(expr)
+    if not words:
+        raise ValueError("空表达式")
 
-    def collect(node):
-        if node.kind == "word":
-            words.append(node.word)
-        for k in node.kids:
-            collect(k)
-    collect(tree)
+    def ev(_node, line):
+        return any(_word_in_line(w, line, case_sensitive, whole_word) for w in words)
 
-    flags = 0 if case_sensitive else -1  # 用 str.find 时手动处理大小写
-
-    def match_word(word, line):
-        return _word_in_line(word, line, case_sensitive, whole_word)
-
-    def ev(node, line):
-        k = node.kind
-        if k == "word":
-            return match_word(node.word, line)
-        if k == "not":
-            return not ev(node.kids[0], line)
-        if k == "or":
-            return any(ev(x, line) for x in node.kids)
-        if k == "and":
-            return all(ev(x, line) for x in node.kids)
-        return False
-
+    tree = Node("or", [Node("word", word=w) for w in words]) if len(words) > 1 \
+        else Node("word", word=words[0])
     return ev, words, tree
 
 
@@ -332,7 +209,7 @@ class FilterDock(QDockWidget):
                          QDockWidget.DockWidgetFloatable)
 
         self.expr_edit = QLineEdit(expr)
-        self.expr_edit.setPlaceholderText('词1 词2 | a && b | !(x|y) | "66"匹配带引号 | 含空格词用 \\ 结尾')
+        self.expr_edit.setPlaceholderText("条件1 | 条件2 | 条件3（| 为 OR；条件原样匹配，空格/引号算内容）")
         self.case_chk = QCheckBox("区分大小写")
         self.case_chk.setChecked(case_sensitive)
         self.whole_chk = QCheckBox("全词")
