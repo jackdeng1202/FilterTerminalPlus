@@ -266,14 +266,20 @@ class TextSearcher(QObject):
         win = self.edit.window()
         if isinstance(win, MainWindow):
             win._pause_follow()  # 查看搜索结果时不要被自动滚动带走
+        # 有选中内容时，把选中词带入搜索框（多行选中合并为含空格的一行）
+        sel = self.edit.textCursor().selectedText()
+        if sel:
+            sel = sel.replace("\u2029", " ").strip()[:200]
+            if sel and sel != self.bar.input.text():
+                self.bar.input.setText(sel)  # textChanged -> 自动重扫
         self.bar.show()
         self.bar.raise_()
         self._reposition()
         self.bar.input.setFocus()
         self.bar.input.selectAll()
-        if self.bar.input.text():
-            # 复次打开且输入框还留着上次的关键词：立即重扫恢复高亮，
-            # 否则命中列表还是 close() 时清空的，点"下一个"会没反应
+        if self.bar.input.text() and not self.matches:
+            # 输入框还留着上次的关键词（或选中词与上次相同未触发信号）：
+            # 立即重扫恢复高亮，否则命中列表还是 close() 时清空的，点"下一个"会没反应
             self.on_needle_changed()
 
     def close(self):
@@ -372,10 +378,14 @@ class TextSearcher(QObject):
         c = self._match_cursor(self.matches[self.cur])
         if c is None:
             return
-        vp = self.edit.viewport()
-        r = self.edit.cursorRect(c)
-        bar = self.edit.verticalScrollBar()
-        bar.setValue(bar.value() + r.center().y() - vp.height() // 2)
+        # 不手算滚动值：QPlainTextEdit 懒布局，未排版块的 cursorRect /
+        # blockBoundingRect 都拿不到可靠坐标（实测返回过期/0 值）。
+        # 先 setTextCursor 滚到可见（触发该行布局），再交给 Qt 原生的
+        # centerCursor() 垂直居中——上/下内容不足时自动钳在边界不留白。
+        c.setPosition(c.selectionStart())
+        edit = self.edit
+        edit.setTextCursor(c)
+        edit.centerCursor()
 
     def _update_count(self):
         n = len(self.matches)
@@ -389,8 +399,10 @@ class TextSearcher(QObject):
         self._scan()
         self.cur = -1
         if self.matches:
-            # 从当前光标位置往后找第一个命中（符合直觉），否则回到第一个
-            here = self.edit.textCursor().position()
+            # 从当前光标位置往后找第一个命中（符合直觉），否则回到第一个。
+            # 有选中内容时用选中区起点——选中词即搜索词，应先定位到选中的这处
+            tc = self.edit.textCursor()
+            here = min(tc.anchor(), tc.position()) if tc.hasSelection() else tc.position()
             doc = self.edit.document()
             self.cur = next((i for i, (bn, s, _e) in enumerate(self.matches)
                              if doc.findBlockByNumber(bn).position() + s >= here), 0)
