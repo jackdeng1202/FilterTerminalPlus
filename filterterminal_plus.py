@@ -149,9 +149,9 @@ def tokenize(expr):
 
 
 class Parser:
-    """递归下降: expr := or; or := and ('|' and)*; and := not ('&&' not)*;
-    not := '!' not | atom; atom := '(' expr ')' | WORD。
-    相邻原子之间若无显式操作符 → 隐含 OR。"""
+    """递归下降: expr := or; or := and ('|' and)*; and := seq (空格相邻原子或
+    '&&' 分隔，均按 AND 组合); not := '!' not | atom; atom := '(' expr ')' | WORD。
+    空格分隔多个词 = 所有词都要命中（AND）。"""
 
     def __init__(self, tokens):
         self.toks = tokens
@@ -182,19 +182,18 @@ class Parser:
         return Node("or", ors) if len(ors) > 1 else node
 
     def and_(self):
-        # 隐含 OR：相邻原子归入同组；&& 分隔不同组。a b && c == (a|b) && c
-        groups = [[self.not_()]]
+        # 空格分隔的相邻原子与 && 都表示 AND：into home == into && home（都要命中）
+        parts = [self.not_()]
         while True:
             k, _ = self.peek()
             if k == "&&":
                 self.next()
-                groups.append([self.not_()])
+                parts.append(self.not_())
             elif k in ("WORD", "(", "!"):
-                groups[-1].append(self.not_())
+                parts.append(self.not_())
             else:
                 break
-        ors = [g[0] if len(g) == 1 else Node("or", g) for g in groups]
-        return ors[0] if len(ors) == 1 else Node("and", ors)
+        return parts[0] if len(parts) == 1 else Node("and", parts)
 
     def not_(self):
         if self.peek() == ("!", None):
