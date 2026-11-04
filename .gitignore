@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 产物
+build/
+dist/
+*.spec.bak
+
+# 分发包
+*.zip
+
+# 运行时生成 / 用户数据（不进版本库）
+config.json
+ftng_config_3568.json
+ftplus_config*.json
+*.log
+
+# 系统
+Thumbs.db
+.DS_Store
