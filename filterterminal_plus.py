@@ -12,13 +12,10 @@ FilterTerminalPlus —— FilterTerminal.exe (v0.95191) 的重写版
 3. 偶发异常 → 原版无全局兜底
    修复: 全局 excepthook + readyRead 逐段 try/except，异常写入日志与状态栏
 
-过滤语法（兼容原版）:
-    词1 词2 词3          —— 隐含 OR（词表过滤，最常用）
-    a && b               —— AND
-    a | b   (或 a || b)  —— OR
-    !a      !(a|b)       —— NOT / 分组
-    "含 空格 的词"        —— 引号包住含空格的词
-    原版写法: 词以 \\ 结尾表示词终止（支持尾部空格），如 test==\\|platformReady \\|...
+过滤语法（简化版）:
+    条件1 | 条件2 | 条件3 —— 只按 | 拆分，命中任一条件即通过
+    条件按原样字面匹配：空格/引号都是内容的一部分，没有其他语法
+    可选：区分大小写、全词匹配（命中两侧不能是字母/数字/下划线/冒号/小数点）
 """
 
 import json
@@ -30,16 +27,18 @@ import traceback
 from collections import deque
 from datetime import datetime
 
-from PySide6.QtCore import QByteArray, QEvent, Qt, QTime, QTimer, Signal
+from PySide6.QtCore import (QByteArray, QEvent, QObject, Qt, QTime, QTimer,
+                            Signal)
 from PySide6.QtGui import (QColor, QFont, QIcon, QKeySequence, QPalette,
                            QShortcut, QTextCharFormat, QTextCursor)
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
-                               QDockWidget, QFileDialog, QFormLayout,
+                               QDockWidget, QFileDialog, QFormLayout, QFrame,
                                QGridLayout, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QMainWindow, QMenu,
                                QPlainTextEdit, QPushButton, QSizePolicy,
-                               QStatusBar, QToolBar, QVBoxLayout, QWidget)
+                               QStatusBar, QTextEdit, QToolBar, QVBoxLayout,
+                               QWidget)
 
 APP_NAME = "FilterTerminalPlus"
 # 配置/日志基准目录：打包成 exe 时放 exe 旁边，脚本运行时放脚本旁边
@@ -165,9 +164,289 @@ def first_matching_word_index(words, line, case_sensitive, whole_word=False):
     return None
 
 
+# ============================================================
+# 文本查找（Ctrl+F）：终端日志 / 过滤窗输出共用
+# 搜索条悬浮在文本区右上角；命中文字淡色高亮，当前命中加重并滚动到可视区
+# ============================================================
+SEARCH_MAX_MATCHES = 20000  # 高亮命中上限，防止超大日志卡顿
+
+
+class _SearchEdit(QLineEdit):
+    """搜索条输入框：Enter=下一个，Shift+Enter=上一个，Esc=关闭。
+    Esc 先 accept ShortcutOverride，避免触发主窗口全局的 ESC 连接互切。"""
+
+    def event(self, e):
+        if e.type() == QEvent.ShortcutOverride and e.key() == Qt.Key_Escape:
+            e.accept()
+            return True
+        return super().event(e)
+
+    def keyPressEvent(self, ev):
+        if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if ev.modifiers() & Qt.ShiftModifier:
+                self.searcher.goto_prev()
+            else:
+                self.searcher.goto_next()
+            return
+        if ev.key() == Qt.Key_Escape:
+            self.searcher.close()
+            return
+        super().keyPressEvent(ev)
+
+
+class SearchBar(QFrame):
+    """悬浮搜索条：输入框 + 计数 + 大小写/全词 + 上一个/下一个 + 关闭。
+    注意父级必须是 QPlainTextEdit 本体而不是 viewport——
+    QPlainTextEdit 滚动是对 viewport 做 scroll() 位块搬移，挂在
+    viewport 上的子控件会跟着日志内容一起被滚出可视区。"""
+
+    def __init__(self, searcher):
+        super().__init__(searcher.edit)  # viewport 的兄弟节点，不随内容滚动
+        self.searcher = searcher
+        self.setObjectName("searchBar")
+        self.setStyleSheet(
+            "QFrame#searchBar { background: palette(window);"
+            " border: 1px solid palette(mid); border-radius: 4px; }")
+        self.input = _SearchEdit()
+        self.input.searcher = searcher
+        self.input.setPlaceholderText("查找（Enter=下一个 Shift+Enter=上一个）")
+        self.input.setFixedWidth(230)
+        self.count_lbl = QLabel("")
+        self.case_chk = QCheckBox("区分大小写")
+        self.whole_chk = QCheckBox("全词")
+        self.whole_chk.setToolTip(
+            "全词匹配：命中处两侧不能是字母/数字/下划线/冒号/小数点")
+        self.prev_btn = QPushButton("上一个")
+        self.next_btn = QPushButton("下一个")
+        self.close_btn = QPushButton("✕")
+        for b in (self.prev_btn, self.next_btn, self.close_btn):
+            b.setFixedHeight(20)
+        self.close_btn.setFixedWidth(20)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(5)
+        lay.addWidget(self.input)
+        lay.addWidget(self.count_lbl)
+        lay.addWidget(self.case_chk)
+        lay.addWidget(self.whole_chk)
+        lay.addWidget(self.prev_btn)
+        lay.addWidget(self.next_btn)
+        lay.addWidget(self.close_btn)
+
+        self.input.textChanged.connect(self.searcher.on_needle_changed)
+        self.case_chk.toggled.connect(self.searcher.on_needle_changed)
+        self.whole_chk.toggled.connect(self.searcher.on_needle_changed)
+        self.prev_btn.clicked.connect(self.searcher.goto_prev)
+        self.next_btn.clicked.connect(self.searcher.goto_next)
+        self.close_btn.clicked.connect(self.searcher.close)
+
+
+class TextSearcher(QObject):
+    """为 QPlainTextEdit 提供查找能力。用法：edit.searcher = TextSearcher(edit)，
+    视图在 keyPressEvent 里把 Ctrl+F 转给 searcher.open()。"""
+
+    def __init__(self, edit):
+        super().__init__(edit)
+        self.edit = edit
+        self.bar = SearchBar(self)
+        self.bar.hide()
+        self.matches = []   # [(block_no, start, end)]，按文档顺序
+        self.cur = -1       # 当前命中的序号
+        self._dirty = False
+        self._rescan = QTimer(self)
+        self._rescan.setSingleShot(True)
+        self._rescan.setInterval(400)  # 日志持续追加时低频重建，不拖慢接收
+        self._rescan.timeout.connect(self._rescan_now)
+        edit.textChanged.connect(self._on_content_changed)
+        edit.viewport().installEventFilter(self)
+
+    # ---- 对外 ----
+    def open(self):
+        win = self.edit.window()
+        if isinstance(win, MainWindow):
+            win._pause_follow()  # 查看搜索结果时不要被自动滚动带走
+        self.bar.show()
+        self.bar.raise_()
+        self._reposition()
+        self.bar.input.setFocus()
+        self.bar.input.selectAll()
+        if self.bar.input.text():
+            # 复次打开且输入框还留着上次的关键词：立即重扫恢复高亮，
+            # 否则命中列表还是 close() 时清空的，点"下一个"会没反应
+            self.on_needle_changed()
+
+    def close(self):
+        self.bar.hide()
+        self.matches = []
+        self.cur = -1
+        self.edit.setExtraSelections([])
+        self.edit.setFocus()
+
+    # ---- 布局 ----
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Resize and obj is self.edit.viewport():
+            self._reposition()
+        return super().eventFilter(obj, ev)
+
+    def _reposition(self):
+        """定位到文本可视区（viewport）右上角。坐标换算成 edit 本体坐标系。"""
+        edit = self.edit
+        vp = edit.viewport()
+        origin = vp.mapTo(edit, vp.rect().topLeft())
+        self.bar.adjustSize()
+        x = origin.x() + max(0, vp.width() - self.bar.width() - 8)
+        self.bar.move(x, origin.y() + 8)
+        self.bar.raise_()  # 盖在 viewport 之上
+
+    # ---- 匹配 ----
+    def _scan(self):
+        needle = self.bar.input.text()
+        self.matches = []
+        if needle:
+            cs = self.bar.case_chk.isChecked()
+            ww = self.bar.whole_chk.isChecked()
+            hay_of = (lambda t: t) if cs else (lambda t: t.lower())
+            pat = hay_of(needle)
+            if len(pat) != len(needle):  # 极少数 Unicode 小写变长，退化为区分大小写
+                cs, pat = True, needle
+            # 全词边界规则与过滤窗一致：命中两侧都是"单词字符相邻"才算粘连
+            wf = _is_word_char(pat[0])
+            wl = _is_word_char(pat[-1])
+            doc = self.edit.document()
+            blk = doc.firstBlock()
+            nlen = len(needle)
+            while blk.isValid() and len(self.matches) < SEARCH_MAX_MATCHES:
+                text = blk.text()
+                hay = hay_of(text)
+                start = 0
+                while len(self.matches) < SEARCH_MAX_MATCHES:
+                    i = hay.find(pat, start)
+                    if i < 0:
+                        break
+                    end = i + nlen
+                    ok = True
+                    if ww:
+                        if i > 0 and _is_word_char(hay[i - 1]) and wf:
+                            ok = False
+                        elif end < len(hay) and _is_word_char(hay[end]) and wl:
+                            ok = False
+                    if ok:
+                        self.matches.append((blk.blockNumber(), i, end))
+                        start = end
+                    else:
+                        start = i + 1
+                blk = blk.next()
+        self._dirty = False
+
+    def _match_cursor(self, m):
+        bn, s, e = m
+        blk = self.edit.document().findBlockByNumber(bn)
+        if not blk.isValid():
+            return None
+        c = QTextCursor(blk)
+        c.setPosition(blk.position() + s)
+        c.setPosition(blk.position() + e, QTextCursor.KeepAnchor)
+        return c
+
+    # ---- 高亮 / 滚动 ----
+    def _apply_highlight(self):
+        sels = []
+        base = QTextCharFormat()
+        base.setBackground(QColor(255, 213, 0, 60))      # 所有命中：淡黄
+        hot = QTextCharFormat()
+        hot.setBackground(QColor(255, 145, 0, 140))      # 当前命中：加重
+        for idx, m in enumerate(self.matches):
+            c = self._match_cursor(m)
+            if c is None:
+                continue
+            es = QTextEdit.ExtraSelection()
+            es.cursor = c
+            es.format = hot if idx == self.cur else base
+            sels.append(es)
+        self.edit.setExtraSelections(sels)
+
+    def _scroll_to_cur(self):
+        if not (0 <= self.cur < len(self.matches)):
+            return
+        c = self._match_cursor(self.matches[self.cur])
+        if c is None:
+            return
+        vp = self.edit.viewport()
+        r = self.edit.cursorRect(c)
+        bar = self.edit.verticalScrollBar()
+        bar.setValue(bar.value() + r.center().y() - vp.height() // 2)
+
+    def _update_count(self):
+        n = len(self.matches)
+        if n == 0:
+            self.bar.count_lbl.setText("无结果" if self.bar.input.text() else "")
+        else:
+            self.bar.count_lbl.setText("%d/%d" % (self.cur + 1, n))
+
+    # ---- 动作 ----
+    def on_needle_changed(self, *_):
+        self._scan()
+        self.cur = -1
+        if self.matches:
+            # 从当前光标位置往后找第一个命中（符合直觉），否则回到第一个
+            here = self.edit.textCursor().position()
+            doc = self.edit.document()
+            self.cur = next((i for i, (bn, s, _e) in enumerate(self.matches)
+                             if doc.findBlockByNumber(bn).position() + s >= here), 0)
+        self._apply_highlight()
+        self._scroll_to_cur()
+        self._update_count()
+
+    def goto_next(self):
+        self._goto(+1)
+
+    def goto_prev(self):
+        self._goto(-1)
+
+    def _goto(self, step):
+        # 有词却无命中：可能是复次打开/刚清空的状态，兜底重扫一次
+        if self._dirty or (not self.matches and self.bar.input.text()):
+            self._scan()
+        if not self.matches:
+            self._update_count()
+            return
+        self.cur = 0 if self.cur < 0 else (self.cur + step) % len(self.matches)
+        self._apply_highlight()
+        self._scroll_to_cur()
+        self._update_count()
+
+    # ---- 日志持续追加 ----
+    def _on_content_changed(self):
+        if not self.bar.isVisible():
+            return
+        self._dirty = True
+        self._rescan.start()
+
+    def _rescan_now(self):
+        if not (self._dirty and self.bar.isVisible()):
+            return
+        keep = self.cur
+        self._scan()
+        if not self.matches:
+            self.cur = -1
+        elif not (0 <= keep < len(self.matches)):
+            self.cur = 0
+        else:
+            self.cur = keep
+        self._apply_highlight()
+        self._update_count()
+
+
 class FilterOutputView(QPlainTextEdit):
-    """过滤窗输出区：点击 = 通知主窗口暂停自动滚动。"""
+    """过滤窗输出区：点击 = 通知主窗口暂停自动滚动；Ctrl+F = 打开查找。"""
     on_press = None  # 由 FilterDock 注入回调
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key_F and ev.modifiers() & Qt.ControlModifier:
+            self.searcher.open()
+            return
+        super().keyPressEvent(ev)
 
     def mousePressEvent(self, ev):
         if self.on_press:
@@ -246,6 +525,7 @@ class FilterDock(QDockWidget):
 
         self.out = FilterOutputView()
         self.out.setReadOnly(True)
+        self.out.searcher = TextSearcher(self.out)  # Ctrl+F 查找
         self.out.on_press = self._notify_press  # 点击输出区 = 暂停自动滚动
         self.out.setMaximumBlockCount(LINE_LIMIT_DEFAULT)
         f = QFont("Consolas", 10)
@@ -420,6 +700,14 @@ class TerminalView(QPlainTextEdit):
 
     def keyPressEvent(self, ev):
         key, mods = ev.key(), ev.modifiers()
+        # Ctrl+F = 在本日志区查找（连接与否都可用，优先级最高）
+        if key == Qt.Key_F and (mods & Qt.ControlModifier):
+            self.searcher.open()
+            return
+        # Ctrl+A = 本地全选日志（不再把 0x01 发给设备；与过滤窗行为一致）
+        if key == Qt.Key_A and (mods & Qt.ControlModifier):
+            self.selectAll()
+            return
         # Ctrl+D = 本地清屏（无论是否连接），不再当 EOF 发给设备；过滤窗输出一并清空
         if (mods & Qt.ControlModifier) and key == Qt.Key_D:
             win = self.window()
@@ -440,8 +728,12 @@ class TerminalView(QPlainTextEdit):
             return
         text = ev.text()
         if mods & Qt.ControlModifier:
-            if key == Qt.Key_C and (mods & Qt.ShiftModifier):
-                self.copy()  # 复制选中文本
+            if key == Qt.Key_C:
+                # 有选中内容 = 复制；无选中 = SIGINT。Ctrl+Shift+C 强制复制
+                if (mods & Qt.ShiftModifier) or self.textCursor().hasSelection():
+                    self.copy()
+                else:
+                    self.sendBytes.emit(b"\x03")
                 return
             if key == Qt.Key_V:  # 粘贴：把剪贴板文本作为输入发给设备（换行转回车）
                 clip = QApplication.clipboard().text()
@@ -449,11 +741,9 @@ class TerminalView(QPlainTextEdit):
                     clip = clip.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r")
                     self.sendBytes.emit(clip.encode("utf-8", "replace"))
                 return
-            ctrl_map = {Qt.Key_C: b"\x03",  # SIGINT
-                        Qt.Key_U: b"\x15",  # 清行
+            ctrl_map = {Qt.Key_U: b"\x15",  # 清行
                         Qt.Key_L: b"\x0c",  # 清屏
                         Qt.Key_Z: b"\x1a",  # SIGTSTP
-                        Qt.Key_A: b"\x01",  # 行首
                         Qt.Key_E: b"\x05",  # 行尾
                         Qt.Key_W: b"\x17",  # 删前一个词
                         Qt.Key_K: b"\x0b",  # 删到行尾
@@ -577,6 +867,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         # 终端控件先建，工具栏信号才能引用
         self.term = TerminalView()
+        self.term.searcher = TextSearcher(self.term)  # Ctrl+F 查找
         self.term.sendBytes.connect(self.send_raw)
         self.term.setReadOnly(True)
         self.term.setMaximumBlockCount(LINE_LIMIT_DEFAULT)
