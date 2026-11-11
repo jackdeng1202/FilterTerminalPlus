@@ -108,15 +108,28 @@ def split_or_expr(expr):
 
 
 def _is_word_char(ch):
-    """单词字符：字母/数字/下划线，另加 ':' 与 '.'。
-    这样 10:22:33、192.168.1.22、3.22 里的 22 不会被"全词 22"命中
-    （冒号/小数点紧贴的数字视为连在一起的一个词）。"""
-    return ch.isalnum() or ch in "_:."
+    """单词字符：字母/数字/下划线（不含冒号/小数点）。"""
+    return ch.isalnum() or ch == "_"
+
+
+def _glued(boundary_ch, inner_ch):
+    """全词匹配时，命中处外侧字符 boundary_ch 是否把词与上下文粘连成一体。
+
+    冒号/小数点只在紧贴数字时才算粘连（时间/IP/时间戳场景）：
+      :22、10:22:33、192.168.1.22、3.22  -> 全词 22 不命中
+    而字母词后跟冒号是普通标签/标点分隔，不算粘连：
+      removed:、inserted:、Current Mode: -> 全词 removed / Mode 照样命中
+    词自身首尾若是标点（如 '"66"'），该侧沿用原逻辑不做边界要求。
+    """
+    if not (inner_ch.isalnum() or inner_ch == "_"):
+        return False
+    if boundary_ch.isalnum() or boundary_ch == "_":
+        return True
+    return boundary_ch in ":." and inner_ch.isdigit()
 
 
 def _word_in_line(word, line, case_sensitive, whole_word):
-    """word 是否出现在 line 中；whole_word 时要求命中处前后都不是单词字符
-    （词本身首/尾若不是单词字符，如引号，则该侧不做边界要求）"""
+    """word 是否出现在 line 中；whole_word 时要求命中处两侧都不粘连。"""
     if not whole_word:
         if case_sensitive:
             return word in line
@@ -131,9 +144,9 @@ def _word_in_line(word, line, case_sensitive, whole_word):
         i = h.find(n, start)
         if i < 0:
             return False
-        before_ok = i == 0 or not _is_word_char(h[i - 1]) or not _is_word_char(n[0])
+        before_ok = i == 0 or not _glued(h[i - 1], n[0])
         j = i + ln
-        after_ok = j >= len(h) or not _is_word_char(h[j]) or not _is_word_char(n[-1])
+        after_ok = j >= len(h) or not _glued(h[j], n[-1])
         if before_ok and after_ok:
             return True
         start = i + 1
@@ -316,9 +329,7 @@ class TextSearcher(QObject):
             pat = hay_of(needle)
             if len(pat) != len(needle):  # 极少数 Unicode 小写变长，退化为区分大小写
                 cs, pat = True, needle
-            # 全词边界规则与过滤窗一致：命中两侧都是"单词字符相邻"才算粘连
-            wf = _is_word_char(pat[0])
-            wl = _is_word_char(pat[-1])
+            # 全词边界规则与过滤窗一致（含冒号/小数点只与数字粘连的特例）
             doc = self.edit.document()
             blk = doc.firstBlock()
             nlen = len(needle)
@@ -333,9 +344,9 @@ class TextSearcher(QObject):
                     end = i + nlen
                     ok = True
                     if ww:
-                        if i > 0 and _is_word_char(hay[i - 1]) and wf:
+                        if i > 0 and _glued(hay[i - 1], pat[0]):
                             ok = False
-                        elif end < len(hay) and _is_word_char(hay[end]) and wl:
+                        elif end < len(hay) and _glued(hay[end], pat[-1]):
                             ok = False
                     if ok:
                         self.matches.append((blk.blockNumber(), i, end))

@@ -2,6 +2,15 @@
 
 串口日志过滤终端，PySide6 重写版。原版 FilterTerminal.exe（v0.95191，Borland C++Builder + CPort 2002 年作品）核心体验保留，修复其顽疾并加入现代功能。
 
+## 下载
+
+**[下载最新版 FTPlus_portable_v4.zip](https://raw.githubusercontent.com/jackdeng1202/FilterTerminalPlus/master/FTPlus_portable_v4.zip)**（27.9 MB，Windows x64 绿色版）
+
+解压得到 `FilterTerminalPlus/` 文件夹，双击里面的 `FilterTerminalPlus.exe` 即用——免安装、无需 Python，整个文件夹可随意拷贝。首次运行会在程序目录生成 `config.json`（历史命令、过滤器、布局都存这里，不会打进包）。
+
+- 仓库内文件页：[FTPlus_portable_v4.zip](https://github.com/jackdeng1202/FilterTerminalPlus/blob/master/FTPlus_portable_v4.zip)（GitHub 页面点 *Download raw file* 同样可下载）
+- v4 包含：`Ctrl+F` 搜索（悬浮固定、选中词带入、命中行垂直居中）、`Ctrl+A` 全选、`Ctrl+C` 选中复制、全词匹配的冒号粘连修复、`|` 字面条件过滤语法、窗口布局持久化等全部功能
+
 ## 特性
 
 ### 串口终端
@@ -17,7 +26,7 @@
 - **表达式语法只有一条：`|` 表示 OR（命中任一条件即可）**：`error|into home|"66"` 命中含 error、或含 `into home`、或含 `"66"` 的行
 - **条件按原样字面匹配**：条件里的空格、引号都是内容的一部分——`into home` 只匹配连续出现 `into home` 的行（不是两个词），`"66"` 只匹配带引号的 66；没有 `&&`、括号、转义等其他语法
 - 连续多个 `|`（如 `a||b`）视为一个 `|`；每个条件首尾空白自动去除（`a | b` 等价 `a|b`）
-- **全词匹配**开关：命中处两侧不能是字母/数字/下划线/冒号/小数点——全词 `22` 不命中 `:22`、`10:22:33`、`192.168.1.22`
+- **全词匹配**开关：命中处两侧不能是字母/数字/下划线；冒号/小数点只在紧贴数字时才算粘连——全词 `22` 不命中 `:22`、`10:22:33`、`192.168.1.22`，而 `removed:`、`Current Mode:` 这类字母词后跟冒号照常命中
 - **自动剔除内核时间戳**：设备自打印的行首 `[ 26.622]` 不参与匹配，只过滤真正内容
 - 区分大小写开关；表达式错误红框内联提示（不弹框）
 - 每窗独立"重放历史"（从最近 5 万行源缓冲全量重算）与"全屏"独占按钮
@@ -32,7 +41,7 @@
 - 主日志区和每个过滤窗输出区都支持 `Ctrl+F`：右上角弹出悬浮搜索条
 - 命中文字淡黄高亮，当前命中加重；`Enter` 下一个 / `Shift+Enter` 或"上一个"按钮反向，到头自动回绕
 - 计数显示"当前/总数"；命中超出可视范围自动滚动到屏中
-- 区分大小写 / 全词开关，与过滤窗同一套全词规则（`22` 不命中 `:22`）
+- 区分大小写 / 全词开关，与过滤窗同一套全词规则（`22` 不命中 `:22`，`removed` 命中 `removed:`）
 - 日志持续追加时搜索结果低频自动刷新；`Esc` 关闭（不会触发连接互切）
 
 ### 其他
@@ -62,7 +71,7 @@ python -m PyInstaller FilterTerminalPlus.spec --noconfirm
 ## 测试
 
 ```bash
-python test_filter_parser.py   # 过滤表达式解析器单元测试（40 例，不依赖 Qt）
+python test_filter_parser.py   # 过滤表达式解析器单元测试（57 例，不依赖 Qt）
 ```
 
 ## 文件说明

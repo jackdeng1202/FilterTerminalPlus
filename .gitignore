@@ -8,8 +8,9 @@ build/
 dist/
 *.spec.bak
 
-# 分发包
+# 分发包（只放行最新便携包供下载，发新版时替换下面这行）
 *.zip
+!FTPlus_portable_v4.zip
 
 # 运行时生成 / 用户数据（不进版本库）
 config.json
